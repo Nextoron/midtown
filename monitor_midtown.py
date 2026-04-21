@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from urllib.parse import quote_plus, urljoin
 
 import requests
@@ -54,8 +55,29 @@ def save_state(state):
         json.dump(sorted(state), f, indent=2)
 
 def post_discord(message: str):
-    r = requests.post(WEBHOOK, json={"content": message}, timeout=20)
-    r.raise_for_status()
+    for attempt in range(5):
+        r = requests.post(WEBHOOK, json={"content": message}, timeout=20)
+
+        if r.status_code in (200, 204):
+            return True
+
+        if r.status_code == 429:
+            retry_after = 5
+            try:
+                data = r.json()
+                retry_after = float(data.get("retry_after", 5))
+            except Exception:
+                pass
+
+            print(f"Rate limited by Discord. Sleeping {retry_after} seconds.")
+            time.sleep(retry_after)
+            continue
+
+        print(f"Discord error {r.status_code}: {r.text}")
+        return False
+
+    print("Failed to send Discord message after retries.")
+    return False
 
 def fetch_search_html(keyword: str) -> str:
     url = BASE_URL + quote_plus(keyword)
@@ -86,11 +108,9 @@ def keyword_matches_title(keyword: str, title: str) -> bool:
     k = keyword.lower().strip()
     t = title.lower()
 
-    # Exact phrase match first
     if k in t:
         return True
 
-    # Then a softer all-words match for phrases
     words = [w for w in k.split() if w]
     return bool(words) and all(w in t for w in words)
 
@@ -114,7 +134,6 @@ def parse_items(html: str, keyword: str):
 
         link = urljoin("https://www.midtowncomics.com", href)
 
-        # Skip obvious non-product/navigation links
         if "/search" in link and "q=" in link:
             continue
         if link.endswith("#"):
@@ -127,7 +146,6 @@ def parse_items(html: str, keyword: str):
         items.append({
             "title": title,
             "link": link,
-            "price": "N/A",
         })
 
     return items
@@ -140,6 +158,8 @@ def main():
     for keyword in keywords:
         html = fetch_search_html(keyword)
         items = parse_items(html, keyword)
+
+        print(f"{keyword}: found {len(items)} matching items")
 
         for item in items:
             key = item["link"]
@@ -155,7 +175,15 @@ def main():
                 f"**Title:** {item['title']}\n"
                 f"{item['link']}"
             )
-            post_discord(message)
+
+            sent = post_discord(message)
+
+            if sent:
+                print(f"Sent: {item['title']}")
+            else:
+                print(f"Skipped after Discord failure: {item['title']}")
+
+            time.sleep(1.25)
 
     save_state(updated_seen)
 
