@@ -1,5 +1,7 @@
 import os
 import json
+from urllib.parse import quote_plus, urljoin
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -14,123 +16,148 @@ EXCLUDES = [
     "hc",
     "omnibus",
     "compendium",
-    "graphic novel"
+    "graphic novel",
+]
+
+BAD_TITLE_EXACT = {
+    "add to cart",
+    "added",
+    "by",
+    "release date",
+    "current price:",
+    "original price:",
+    "view more...",
+    "quick view",
+}
+
+BAD_TITLE_CONTAINS = [
+    "choose qty for",
+    "in cart",
+    "free shipping",
+    "free bag & board",
+    "order online for in-store pick up",
 ]
 
 def load_keywords():
     with open("keywords.txt", "r", encoding="utf-8") as f:
-        keywords = [k.strip().lower() for k in f if k.strip()]
-    print(f"DEBUG: loaded keywords -> {keywords}")
-    return keywords
+        return [line.strip().lower() for line in f if line.strip()]
 
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = set(json.load(f))
-            print(f"DEBUG: loaded state with {len(state)} items")
-            return state
-    except Exception as e:
-        print(f"DEBUG: no existing state or failed to load state ({e})")
+            return set(json.load(f))
+    except Exception:
         return set()
 
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(state), f)
-    print(f"DEBUG: saved state with {len(state)} items")
+        json.dump(sorted(state), f, indent=2)
 
-def post(msg):
-    print("DEBUG: sending Discord message")
-    r = requests.post(WEBHOOK, json={"content": msg}, timeout=20)
-    print(f"DEBUG: Discord response status -> {r.status_code}")
+def post_discord(message: str):
+    r = requests.post(WEBHOOK, json={"content": message}, timeout=20)
     r.raise_for_status()
 
-def fetch_results(keyword):
-    url = BASE_URL + keyword.replace(" ", "+")
-    print(f"DEBUG: fetching -> {url}")
+def fetch_search_html(keyword: str) -> str:
+    url = BASE_URL + quote_plus(keyword)
     headers = {"User-Agent": "Mozilla/5.0"}
     r = requests.get(url, headers=headers, timeout=30)
-    print(f"DEBUG: fetch status for '{keyword}' -> {r.status_code}")
     r.raise_for_status()
     return r.text
 
-def parse_items(html):
+def normalize_spaces(text: str) -> str:
+    return " ".join(text.split()).strip()
+
+def looks_like_noise(title: str) -> bool:
+    t = normalize_spaces(title).lower()
+
+    if len(t) < 5:
+        return True
+    if t in BAD_TITLE_EXACT:
+        return True
+    if any(bad in t for bad in BAD_TITLE_CONTAINS):
+        return True
+    return False
+
+def excluded_format(title: str) -> bool:
+    t = title.lower()
+    return any(ex in t for ex in EXCLUDES)
+
+def keyword_matches_title(keyword: str, title: str) -> bool:
+    k = keyword.lower().strip()
+    t = title.lower()
+
+    # Exact phrase match first
+    if k in t:
+        return True
+
+    # Then a softer all-words match for phrases
+    words = [w for w in k.split() if w]
+    return bool(words) and all(w in t for w in words)
+
+def parse_items(html: str, keyword: str):
     soup = BeautifulSoup(html, "html.parser")
-    print(f"DEBUG: page title -> {soup.title.string if soup.title else 'NO TITLE'}")
-
     items = []
+    seen_links = set()
 
-    # Broad temporary parser for debugging
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
-        title = a.get_text(" ", strip=True)
+        title = normalize_spaces(a.get_text(" ", strip=True))
+        href = a.get("href", "").strip()
 
-        if not title or len(title) < 5:
+        if not title or not href:
+            continue
+        if looks_like_noise(title):
+            continue
+        if excluded_format(title):
+            continue
+        if not keyword_matches_title(keyword, title):
             continue
 
-        if "/store/" not in href:
+        link = urljoin("https://www.midtowncomics.com", href)
+
+        # Skip obvious non-product/navigation links
+        if "/search" in link and "q=" in link:
+            continue
+        if link.endswith("#"):
             continue
 
-        if href.startswith("http"):
-            link = href
-        else:
-            link = "https://www.midtowncomics.com" + href
+        if link in seen_links:
+            continue
 
+        seen_links.add(link)
         items.append({
             "title": title,
             "link": link,
-            "price": "N/A"
+            "price": "N/A",
         })
 
-    print(f"DEBUG: parsed {len(items)} raw items")
-    if items:
-        print(f"DEBUG: first item -> {items[0]}")
     return items
 
-def is_valid(title):
-    t = title.lower()
-    for ex in EXCLUDES:
-        if ex in t:
-            return False
-    return True
-
 def main():
-    print("DEBUG: script started")
     keywords = load_keywords()
     seen = load_state()
-    new_seen = set(seen)
+    updated_seen = set(seen)
 
     for keyword in keywords:
-        print(f"DEBUG: checking keyword -> {keyword}")
-        html = fetch_results(keyword)
-        items = parse_items(html)
+        html = fetch_search_html(keyword)
+        items = parse_items(html, keyword)
 
         for item in items:
-            title = item["title"]
-
-            if not is_valid(title):
-                print(f"DEBUG: excluded -> {title}")
-                continue
-
             key = item["link"]
 
             if key in seen:
                 continue
 
-            print(f"DEBUG: new match -> {title}")
-            new_seen.add(key)
+            updated_seen.add(key)
 
-            msg = (
+            message = (
                 f"🟢 **New Midtown Match**\n"
                 f"**Keyword:** {keyword}\n"
-                f"**Title:** {title}\n"
-                f"**Price:** {item['price']}\n"
+                f"**Title:** {item['title']}\n"
                 f"{item['link']}"
             )
+            post_discord(message)
 
-            post(msg)
-
-    save_state(new_seen)
-    print("DEBUG: script finished")
+    save_state(updated_seen)
 
 if __name__ == "__main__":
     main()
