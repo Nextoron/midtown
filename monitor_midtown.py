@@ -46,28 +46,38 @@ def fetch_results(keyword):
 
 def parse_items(html):
     soup = BeautifulSoup(html, "html.parser")
+
+    print("DEBUG: Page title:", soup.title)
+
     items = []
 
-    for card in soup.select(".product"):
-        title_tag = card.select_one(".product-title")
-        price_tag = card.select_one(".price")
+    # Print some raw HTML sample so we can inspect structure
+    sample = soup.prettify()[:1000]
+    print("DEBUG HTML SAMPLE:")
+    print(sample)
 
-        if not title_tag:
+    for card in soup.find_all("a"):
+        title = card.get_text(strip=True)
+
+        if not title or len(title) < 5:
             continue
 
-        href = title_tag.get("href")
+        href = card.get("href")
         if not href:
             continue
 
-        title = title_tag.get_text(strip=True)
+        if "/store/" not in href:
+            continue
+
         link = "https://www.midtowncomics.com" + href
-        price = price_tag.get_text(strip=True) if price_tag else "N/A"
 
         items.append({
             "title": title,
             "link": link,
-            "price": price
+            "price": "N/A"
         })
+
+    print(f"DEBUG: Parsed {len(items)} items")
 
     return items
 
