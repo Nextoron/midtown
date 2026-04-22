@@ -192,36 +192,7 @@ def extract_price(text: str):
     return None
 
 
-def extract_image_url(soup: BeautifulSoup):
-    meta_candidates = [
-        ("meta", {"property": "og:image"}, "content"),
-        ("meta", {"name": "twitter:image"}, "content"),
-        ("meta", {"property": "twitter:image"}, "content"),
-    ]
-
-    for tag_name, attrs, value_attr in meta_candidates:
-        tag = soup.find(tag_name, attrs=attrs)
-        if tag and tag.get(value_attr):
-            return tag.get(value_attr)
-
-    for img in soup.find_all("img", src=True):
-        src = img.get("src", "")
-        if not src:
-            continue
-        if "logo" in src.lower():
-            continue
-        return urljoin("https://www.midtowncomics.com", src)
-
-    return None
-
-
 def detect_stock_status(page_text: str):
-    """
-    Conservative stock detector:
-    - returns True if clearly in stock
-    - returns False if clearly out of stock
-    - returns False if unclear (safer: avoid false pings)
-    """
     t = normalize_spaces(page_text).lower()
 
     for phrase in OUT_OF_STOCK_PHRASES:
@@ -242,7 +213,6 @@ def fetch_product_details(link: str):
         text = soup.get_text(" ", strip=True)
 
         price = extract_price(text)
-        image = extract_image_url(soup)
         in_stock = detect_stock_status(text)
 
         title_tag = soup.find("meta", attrs={"property": "og:title"})
@@ -250,7 +220,6 @@ def fetch_product_details(link: str):
 
         return {
             "price": price,
-            "image": image,
             "page_title": page_title,
             "in_stock": in_stock,
         }
@@ -258,7 +227,6 @@ def fetch_product_details(link: str):
         print(f"Failed to fetch product details for {link}: {e}")
         return {
             "price": None,
-            "image": None,
             "page_title": None,
             "in_stock": False,
         }
@@ -290,76 +258,87 @@ def discord_post(payload):
     return False
 
 
-def send_new_item_alert(item, price, image):
-    price_text = f"${price:.2f}" if isinstance(price, (int, float)) else "N/A"
+def build_embed(alert_type, item, status_text, price_text, old_price_text=None, new_price_text=None):
+    title_prefix = {
+        "new": "🚨 NEW MIDTOWN MATCH",
+        "restock": "🔄 MIDTOWN RESTOCK",
+        "price_drop": "💸 MIDTOWN PRICE DROP",
+    }[alert_type]
 
-    payload = {
-        "content": None,
+    fields = [
+        {
+            "name": "🔍 Keyword",
+            "value": item["keyword"],
+            "inline": True
+        },
+        {
+            "name": "📦 Status",
+            "value": status_text,
+            "inline": True
+        }
+    ]
+
+    if alert_type == "price_drop":
+        fields.insert(1, {
+            "name": "💰 Old Price",
+            "value": old_price_text,
+            "inline": True
+        })
+        fields.insert(2, {
+            "name": "💵 New Price",
+            "value": new_price_text,
+            "inline": True
+        })
+    else:
+        fields.insert(1, {
+            "name": "💰 Price",
+            "value": price_text,
+            "inline": True
+        })
+
+    return {
         "embeds": [
             {
-                "title": "New Midtown Match",
-                "description": (
-                    f"**Keyword:** {item['keyword']}\n"
-                    f"**Title:** {item['title']}\n"
-                    f"**Price:** {price_text}\n"
-                    f"**Status:** In Stock"
-                ),
+                "title": f"{title_prefix} — {item['title']}",
                 "url": item["link"],
+                "color": 5814783,
+                "fields": fields
             }
         ]
     }
 
-    if image:
-        payload["embeds"][0]["image"] = {"url": image}
 
+def send_new_item_alert(item, price):
+    price_text = f"${price:.2f}" if isinstance(price, (int, float)) else "N/A"
+    payload = build_embed(
+        alert_type="new",
+        item=item,
+        status_text="In Stock",
+        price_text=price_text
+    )
     return discord_post(payload)
 
 
-def send_restock_alert(item, price, image):
+def send_restock_alert(item, price):
     price_text = f"${price:.2f}" if isinstance(price, (int, float)) else "N/A"
-
-    payload = {
-        "content": None,
-        "embeds": [
-            {
-                "title": "Midtown Restock",
-                "description": (
-                    f"**Keyword:** {item['keyword']}\n"
-                    f"**Title:** {item['title']}\n"
-                    f"**Price:** {price_text}\n"
-                    f"**Status:** Back In Stock"
-                ),
-                "url": item["link"],
-            }
-        ]
-    }
-
-    if image:
-        payload["embeds"][0]["image"] = {"url": image}
-
+    payload = build_embed(
+        alert_type="restock",
+        item=item,
+        status_text="Back In Stock",
+        price_text=price_text
+    )
     return discord_post(payload)
 
 
-def send_price_drop_alert(item, old_price, new_price, image):
-    payload = {
-        "content": None,
-        "embeds": [
-            {
-                "title": "Midtown Price Drop",
-                "description": (
-                    f"**Keyword:** {item['keyword']}\n"
-                    f"**Title:** {item['title']}\n"
-                    f"**Old Price:** ${old_price:.2f}\n"
-                    f"**New Price:** ${new_price:.2f}"
-                ),
-                "url": item["link"],
-            }
-        ]
-    }
-
-    if image:
-        payload["embeds"][0]["image"] = {"url": image}
-
+def send_price_drop_alert(item, old_price, new_price):
+    payload = build_embed(
+        alert_type="price_drop",
+        item=item,
+        status_text="In Stock",
+        price_text=None,
+        old_price_text=f"${old_price:.2f}",
+        new_price_text=f"${new_price:.2f}"
+    )
     return discord_post(payload)
 
 
@@ -383,7 +362,6 @@ def main():
 
             details = fetch_product_details(link)
             price = details["price"]
-            image = details["image"]
             in_stock = details["in_stock"]
 
             if details["page_title"]:
@@ -394,10 +372,9 @@ def main():
             if excluded_format(item["title"]):
                 continue
 
-            # Brand new item
             if old_record is None:
                 if not baseline_mode and in_stock:
-                    sent = send_new_item_alert(item, price, image)
+                    sent = send_new_item_alert(item, price)
                     print(f"New item alert: {item['title']} | sent={sent}")
                     time.sleep(1.25)
 
@@ -405,7 +382,6 @@ def main():
                     "title": item["title"],
                     "keyword": item["keyword"],
                     "price": price,
-                    "image": image,
                     "in_stock": in_stock,
                     "last_seen": now_iso(),
                 }
@@ -414,13 +390,11 @@ def main():
             old_price = old_record.get("price")
             old_in_stock = bool(old_record.get("in_stock", False))
 
-            # Restock alert
             if (not old_in_stock) and in_stock and (not baseline_mode):
-                sent = send_restock_alert(item, price, image)
+                sent = send_restock_alert(item, price)
                 print(f"Restock alert: {item['title']} | sent={sent}")
                 time.sleep(1.25)
 
-            # Price drop alert
             if (
                 old_in_stock
                 and in_stock
@@ -429,7 +403,7 @@ def main():
                 and price < old_price
                 and (not baseline_mode)
             ):
-                sent = send_price_drop_alert(item, old_price, price, image)
+                sent = send_price_drop_alert(item, old_price, price)
                 print(f"Price drop alert: {item['title']} | {old_price} -> {price} | sent={sent}")
                 time.sleep(1.25)
 
@@ -437,7 +411,6 @@ def main():
                 "title": item["title"],
                 "keyword": item["keyword"],
                 "price": price,
-                "image": image,
                 "in_stock": in_stock,
                 "last_seen": now_iso(),
             }
